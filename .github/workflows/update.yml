@@ -1,0 +1,49 @@
+name: Update Rental Report
+
+on:
+  schedule:
+    - cron: '6 0 * * 1,3,5'   # 10:06 AM AEST Mon/Wed/Fri
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install playwright
+          playwright install chromium
+
+      - name: Run scraper
+        run: python3 scraper.py
+
+      - name: Commit and push
+        run: |
+          git config user.name "Rental Bot"
+          git config user.email "bot@rental-report.local"
+          git add index.html
+          git diff --staged --quiet || (git commit -m "Auto update $(date -u +'%Y-%m-%d %H:%M UTC')" && git push)
+
+  deploy:
+    needs: update
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v4
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: '.'
+      - uses: actions/deploy-pages@v4
+        id: deployment
