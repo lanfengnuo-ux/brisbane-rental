@@ -4,7 +4,7 @@
 每周一三五 10:00 运行，抓取 The Onsite Manager 数据生成 HTML
 """
 from playwright.sync_api import sync_playwright
-import time, re, json
+import time, re, json, sys
 from datetime import datetime
 from pathlib import Path
 
@@ -358,6 +358,12 @@ def main():
             print(f"  ✓ {city_name}: {valid} listings")
 
         browser.close()
+
+    total_listings = sum(len(v) for v in all_data.values() if v)
+    if total_listings == 0:
+        print("\n❌ ERROR: No data fetched for any city! Refusing to write empty report.")
+        print("   (GitHub runner IP likely blocked. Run locally instead.)")
+        sys.exit(1)
 
     html = generate_html(all_data)
     OUTPUT_FILE.write_text(html, encoding='utf-8')
