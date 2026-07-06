@@ -1,6 +1,9 @@
 name: Update Rental Report
 
 on:
+  push:
+    paths:
+      - index.html
   schedule:
     - cron: '6 0 * * 1,3,5'   # 10:06 AM AEST Mon/Wed/Fri
   workflow_dispatch:
