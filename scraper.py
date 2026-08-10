@@ -20,7 +20,7 @@ CITIES = {
         "link_pattern": "/apartment-for-rent/",
     },
     "Brisbane City": {
-        "url_template": "https://www.theonsitemanager.com.au/rental-property?location=Brisbane%20City&page={page}",
+        "url_template": "https://www.theonsitemanager.com.au/rental-property/apartment?location=BRISBANE+CITY&proximity=0.20&page={page}",
         "link_pattern": "/apartment-for-rent/",
     },
 }
