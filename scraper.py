@@ -9,6 +9,36 @@ from datetime import datetime
 from pathlib import Path
 
 OUTPUT_FILE = Path(__file__).parent / "index.html"
+HISTORY_FILE = Path(__file__).parent / "previous_data.json"
+
+
+def load_previous_data():
+    """Load previous scrape data, return {listing_id: {rent, city, first_seen}}."""
+    if not HISTORY_FILE.exists():
+        return {}
+    try:
+        with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return data.get('listings', {})
+    except (json.JSONDecodeError, KeyError, IOError):
+        return {}
+
+
+def save_previous_data(all_data):
+    """Save current listings as previous data for next comparison."""
+    listings = {}
+    for city_name, city_listings in all_data.items():
+        for l in city_listings:
+            lid = l.get('id', '')
+            if lid and lid != '?' and l.get('address') != '?':
+                listings[lid] = {
+                    'rent_weekly': int(l.get('rent_weekly', '0') or '0'),
+                    'city': city_name,
+                    'first_seen': l.get('_first_seen', datetime.now().strftime('%Y-%m-%d')),
+                }
+    with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
+        json.dump({'listings': listings, 'last_updated': datetime.now().strftime('%Y-%m-%d %H:%M')}, f, ensure_ascii=False)
+
 
 CITIES = {
     "Toowong": {
@@ -84,8 +114,8 @@ def scrape_city(browser, city_name, config):
         block_resources(page)
 
         try:
-            page.goto(full_url, wait_until="load", timeout=20000)
-            page.wait_for_timeout(800)
+            page.goto(full_url, wait_until="domcontentloaded", timeout=10000)
+            page.wait_for_timeout(500)
 
             # Click truncated phone buttons to reveal full numbers
             for btn in page.locator('a:has-text("Call"):not([href^="tel:"])').all():
@@ -237,13 +267,45 @@ def generate_html(all_data):
                 contact = l.get('contact', '见页面')
                 phone = l.get('phone', '?')
                 detail_url = l.get('url', '#')
+                bed = l.get('bed', '0')
+                is_new = l.get('is_new', False)
+                price_drop = l.get('price_drop', 0)
+
+                # Date formatting for sorting
+                date_sort = '99999999'
+                date_display = date_avail
+                try:
+                    dt = datetime.strptime(date_avail, '%d %b %Y')
+                    date_sort = dt.strftime('%Y%m%d')
+                    today = datetime.now()
+                    days_until = (dt - today).days
+                    if 'Available' in date_avail.lower() or 'now' in date_avail.lower() or days_until <= 0:
+                        date_sort = '00000000'
+                        date_display = f'<span class="date-soon">即日可租</span>'
+                    elif days_until <= 14:
+                        date_display = f'<span class="date-soon">{date_avail}</span>'
+                except ValueError:
+                    pass
+
+                # Search text for filtering
+                search_text = f'{layout} {addr} {sub} {rent} {furnished} {contact} {phone}'.lower()
+
+                # Data attributes for filtering/sorting
+                data_attrs = f'data-furnished="{furnished}" data-bed="{bed}" data-rent="{rent}" data-date="{date_sort}" data-suburb="{sub}" data-search="{search_text}"'
 
                 fb = {'是': '<span class="badge badge-yes">是</span>',
                       '否': '<span class="badge badge-no">否</span>'}.get(furnished, '<span class="badge badge-unk">未知</span>')
                 ph = f'<a href="tel:{phone.replace(" ","")}" class="phone-link">{phone}</a>' if phone and phone != '?' else '<span class="no-link">—</span>'
                 btn = f'<a href="{detail_url}" target="_blank" class="apply-btn">详情</a>' if detail_url else '<span class="no-link">—</span>'
 
-                rows += f'<tr><td><span class="room-name">{layout}</span><div class="addr">{addr}</div></td><td>{fb}</td><td><span class="price">${rent}</span>/周</td><td>{date_avail}</td><td>{contact}</td><td>{ph}</td><td>{btn}</td></tr>'
+                # Price column with badges
+                price_html = f'<span class="price">${rent}</span>'
+                if is_new:
+                    price_html += ' <span class="badge badge-new">🆕 新上</span>'
+                if price_drop > 0:
+                    price_html += f' <span class="badge badge-drop">🔻 -${price_drop}</span>'
+
+                rows += f'<tr {data_attrs}><td><span class="room-name">{layout}</span><div class="addr">{addr}</div></td><td>{fb}</td><td>{price_html}<span class="pw">/周</span></td><td>{date_display}</td><td>{contact}</td><td>{ph}</td><td>{btn}</td></tr>'
 
         total = len(valid)
         min_p = min(int(l['rent_weekly']) for l in valid if l['rent_weekly'].isdigit()) if valid else 0
@@ -259,10 +321,35 @@ def generate_html(all_data):
             <div class="stat"><div class="num">${max_p}</div><div class="lbl">最高周租</div></div>
             <div class="stat"><div class="num">{furn_yes}</div><div class="lbl">包家具</div></div>
         </div>
+        <div class="filter-bar" id="filter-{slug}">
+            <input type="text" class="filter-search" placeholder="🔍 搜索地址/区域/联系人..." oninput="filterTable('{slug}')">
+            <div class="filter-btns">
+                <span class="filter-label">家具:</span>
+                <button class="fbtn active" data-filter="furnished" data-val="all" onclick="setFilter('{slug}','furnished','all',this)">全部</button>
+                <button class="fbtn" data-filter="furnished" data-val="是" onclick="setFilter('{slug}','furnished','是',this)">🛋️ 包家具</button>
+                <button class="fbtn" data-filter="furnished" data-val="否" onclick="setFilter('{slug}','furnished','否',this)">📦 不包家具</button>
+            </div>
+            <div class="filter-btns">
+                <span class="filter-label">户型:</span>
+                <button class="fbtn active" data-filter="layout" data-val="all" onclick="setFilter('{slug}','layout','all',this)">全部</button>
+                <button class="fbtn" data-filter="layout" data-val="studio" onclick="setFilter('{slug}','layout','studio',this)">Studio</button>
+                <button class="fbtn" data-filter="layout" data-val="1" onclick="setFilter('{slug}','layout','1',this)">1室</button>
+                <button class="fbtn" data-filter="layout" data-val="2" onclick="setFilter('{slug}','layout','2',this)">2室</button>
+                <button class="fbtn" data-filter="layout" data-val="3" onclick="setFilter('{slug}','layout','3',this)">3室+</button>
+            </div>
+            <div class="filter-btns filter-rent">
+                <span class="filter-label">周租金:</span>
+                <input type="number" class="rent-input" placeholder="最低" onchange="filterTable('{slug}')" id="rent-min-{slug}">
+                <span class="rent-sep">—</span>
+                <input type="number" class="rent-input" placeholder="最高" onchange="filterTable('{slug}')" id="rent-max-{slug}">
+            </div>
+            <span class="filter-count" id="fcount-{slug}"></span>
+            <button class="fbtn fclear" onclick="clearFilters('{slug}')">✕ 清除筛选</button>
+        </div>
         <div class="table-wrap">
             <table>
-                <thead><tr><th>户型 / 地址</th><th>家具</th><th>周租金</th><th>可入住</th><th>联系人</th><th>电话</th><th>详情</th></tr></thead>
-                <tbody>{rows}</tbody>
+                <thead><tr><th class="sortable" data-sort="layout" onclick="sortTable('{slug}', this)">户型 / 地址 <span class="sa"></span></th><th class="sortable" data-sort="furnished" onclick="sortTable('{slug}', this)">家具 <span class="sa"></span></th><th class="sortable" data-sort="rent" onclick="sortTable('{slug}', this)">周租金 <span class="sa"></span></th><th class="sortable" data-sort="date" onclick="sortTable('{slug}', this)">可入住 <span class="sa"></span></th><th>联系人</th><th>电话</th><th>详情</th></tr></thead>
+                <tbody>{rows}<tr class="empty-state"><td colspan="7">😕 没有匹配的房源，试试调整筛选条件</td></tr></tbody>
             </table>
         </div>
     </div>'''
@@ -323,6 +410,34 @@ def generate_html(all_data):
     .no-link{{ color:var(--text-muted);font-size:0.8rem }}
     .footer{{ margin-top:40px;padding-top:20px;border-top:1px solid var(--border);text-align:center;color:var(--text-muted);font-size:0.78rem }}
     .footer a{{ color:var(--text-muted) }}
+    .filter-bar{{ display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:12px 16px;background:var(--card-bg);border:1px solid var(--border);border-radius:var(--radius);margin-bottom:12px;position:sticky;top:0;z-index:5 }}
+    .filter-search{{ flex:0 1 200px;padding:7px 12px;border:1px solid var(--border);border-radius:6px;font-size:0.82rem;font-family:var(--font);background:var(--bg);color:var(--text);min-width:160px }}
+    .filter-search:focus{{ border-color:#E21836;outline:none;box-shadow:0 0 0 2px rgba(226,24,54,.12) }}
+    .filter-btns{{ display:flex;align-items:center;gap:4px }}
+    .filter-label{{ font-size:0.7rem;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.05em;margin-right:2px;white-space:nowrap }}
+    .fbtn{{ padding:5px 11px;border:1px solid var(--border);border-radius:99px;cursor:pointer;font-size:0.76rem;font-weight:500;background:var(--bg);color:var(--text-muted);font-family:var(--font);transition:all 150ms;white-space:nowrap }}
+    .fbtn:hover{{ border-color:var(--text-muted);color:var(--text) }}
+    .fbtn.active{{ background:#E21836;color:#fff;border-color:#E21836;font-weight:600 }}
+    .fclear{{ background:transparent;border-color:transparent;color:var(--text-muted);font-size:0.72rem }}
+    .fclear:hover{{ color:#E21836;background:transparent }}
+    .filter-rent{{ gap:6px }}
+    .rent-input{{ width:72px;padding:5px 8px;border:1px solid var(--border);border-radius:6px;font-size:0.8rem;font-family:var(--font);background:var(--bg);color:var(--text) }}
+    .rent-input:focus{{ border-color:#E21836;outline:none;box-shadow:0 0 0 2px rgba(226,24,54,.12) }}
+    .rent-sep{{ color:var(--text-muted);font-size:0.8rem }}
+    .filter-count{{ font-size:0.75rem;color:var(--text-muted);white-space:nowrap;margin-left:auto }}
+    .pw{{ font-size:0.82rem;color:var(--text-muted) }}
+    .badge-new{{ background:#d1fae5;color:#065f46;margin-left:4px }}
+    .badge-drop{{ background:#fef2f2;color:#dc2626;margin-left:4px }}
+    .date-soon{{ color:#059669;font-weight:600 }}
+    th.sortable{{ cursor:pointer;user-select:none;transition:background 150ms }}
+    th.sortable:hover{{ background:#ffe5e6 }}
+    .sa{{ font-size:0.65rem;margin-left:3px;opacity:0.4 }}
+    .sa.asc{{ opacity:1;color:#E21836 }}
+    .sa.desc{{ opacity:1;color:#E21836 }}
+    tr.hidden{{ display:none }}
+    .empty-state{{ text-align:center;padding:40px 20px;color:var(--text-muted);display:none }}
+    .empty-state.show{{ display:table-row }}
+    .empty-state td{{ padding:40px 20px!important }}
     @media(max-width:768px){{ body{{ padding:20px 12px 50px }} .table-wrap{{ overflow-x:auto;-webkit-overflow-scrolling:touch }} table{{ min-width:720px;font-size:0.8rem }} .stats{{ gap:8px }} .stat{{ padding:10px 14px }} }}
 </style>
 </head>
@@ -335,11 +450,124 @@ def generate_html(all_data):
 {panels}
 <div class="footer"><p>数据来源: <a href="https://www.theonsitemanager.com.au" target="_blank">theonsitemanager.com.au</a> · 更新于 {now}</p></div>
 <script>
+// --- Filter & Sort State (per tab) ---
+const _state = {{}};
+function st(slug) {{
+    if (!_state[slug]) _state[slug] = {{furnished:'all',layout:'all',sortCol:null,sortDir:1}};
+    return _state[slug];
+}}
+
 function switchCity(slug) {{
     document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
     document.querySelectorAll('.city-panel').forEach(p=>p.classList.remove('active'));
     document.querySelector('.tab-btn[data-slug="'+slug+'"]').classList.add('active');
     document.getElementById('panel-'+slug).classList.add('active');
+    filterTable(slug);
+}}
+
+// --- Filter ---
+function setFilter(slug, type, val, btn) {{
+    st(slug)[type] = val;
+    btn.parentElement.querySelectorAll('.fbtn').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');
+    filterTable(slug);
+}}
+
+function clearFilters(slug) {{
+    var s = st(slug);
+    s.furnished = 'all'; s.layout = 'all';
+    var bar = document.getElementById('filter-'+slug);
+    if(bar){{
+        bar.querySelectorAll('.fbtn').forEach(function(b){{ if(b.getAttribute('data-val')==='all') b.classList.add('active'); else b.classList.remove('active'); }});
+        var mi = document.getElementById('rent-min-'+slug), mx = document.getElementById('rent-max-'+slug);
+        if(mi) mi.value = ''; if(mx) mx.value = '';
+        var si = bar.querySelector('.filter-search');
+        if(si) si.value = '';
+    }}
+    filterTable(slug);
+}}
+
+function filterTable(slug) {{
+    var s = st(slug);
+    var panel = document.getElementById('panel-'+slug);
+    if(!panel || !panel.classList.contains('active')) return;
+    var rows = panel.querySelectorAll('tbody tr:not(.cat-divider):not(.empty-state)');
+    var searchInput = panel.querySelector('.filter-search');
+    var search = searchInput ? searchInput.value.toLowerCase() : '';
+    var rentMin = parseInt((document.getElementById('rent-min-'+slug)||{{}}).value) || 0;
+    var rentMax = parseInt((document.getElementById('rent-max-'+slug)||{{}}).value) || 99999;
+    var count = 0;
+    var visibleSuburbs = {{}};
+    rows.forEach(function(r){{
+        var show = true;
+        if (s.furnished !== 'all' && r.getAttribute('data-furnished') !== s.furnished) show = false;
+        var bed = parseInt(r.getAttribute('data-bed')||'0');
+        if (s.layout === 'studio' && bed !== 0) show = false;
+        else if (s.layout === '1' && bed !== 1) show = false;
+        else if (s.layout === '2' && bed !== 2) show = false;
+        else if (s.layout === '3' && bed < 3) show = false;
+        var rent = parseInt(r.getAttribute('data-rent')) || 0;
+        if (rent > 0 && (rent < rentMin || rent > rentMax)) show = false;
+        if (search && (r.getAttribute('data-search')||'').indexOf(search) === -1) show = false;
+        if (show) {{ r.classList.remove('hidden'); count++; visibleSuburbs[r.getAttribute('data-suburb')]=true; }}
+        else r.classList.add('hidden');
+    }});
+    // Hide empty suburb dividers
+    panel.querySelectorAll('tbody tr.cat-divider').forEach(function(d){{
+        var label = (d.querySelector('.cat-label')||{{}}).textContent||'';
+        d.classList.toggle('hidden', !visibleSuburbs[label]);
+    }});
+    // Update count
+    var fc = document.getElementById('fcount-'+slug);
+    if (fc) fc.textContent = '找到 '+count+' 套';
+    // Show/hide empty state
+    var es = panel.querySelector('.empty-state');
+    if (es) es.classList.toggle('show', count === 0);
+    // Re-apply current sort if active
+    if (s.sortCol) {{
+        var th = document.querySelector('#panel-'+slug+' th[data-sort="'+s.sortCol+'"]');
+        if (th) sortTable(slug, th, true);
+    }}
+}}
+
+// --- Sort ---
+function sortTable(slug, th, keepDir) {{
+    if (!th) return;
+    var s = st(slug);
+    var col = th.getAttribute('data-sort');
+    if (!keepDir) {{
+        if (s.sortCol === col) s.sortDir *= -1;
+        else {{ s.sortCol = col; s.sortDir = 1; }}
+    }}
+    var dir = s.sortDir;
+    // Update arrows
+    document.querySelectorAll('#panel-'+slug+' th .sa').forEach(function(a){{ a.textContent='';a.classList.remove('asc','desc'); }});
+    var arrow = th.querySelector('.sa');
+    if (arrow) {{ arrow.textContent = dir > 0 ? '▲' : '▼'; arrow.classList.add(dir > 0 ? 'asc' : 'desc'); }}
+    // Sort
+    var panel = document.getElementById('panel-'+slug);
+    var tbody = panel.querySelector('tbody');
+    var rows = Array.from(tbody.querySelectorAll('tr:not(.cat-divider):not(.empty-state)'));
+    rows.sort(function(a,b){{
+        var va, vb;
+        if (col === 'rent') {{ va = parseInt(a.getAttribute('data-rent'))||0; vb = parseInt(b.getAttribute('data-rent'))||0; }}
+        else if (col === 'date') {{ va = a.getAttribute('data-date')||'99999999'; vb = b.getAttribute('data-date')||'99999999'; }}
+        else if (col === 'furnished') {{ var fo={{'是':1,'否':2,'未知':3}}; va=fo[a.getAttribute('data-furnished')]||2; vb=fo[b.getAttribute('data-furnished')]||2; }}
+        else if (col === 'layout') {{ va = parseInt(a.getAttribute('data-bed'))||0; vb = parseInt(b.getAttribute('data-bed'))||0; if(va===vb){{ va=(a.getAttribute('data-suburb')||''); vb=(b.getAttribute('data-suburb')||''); return va.localeCompare(vb)*dir; }} }}
+        if (typeof va === 'string') return va.localeCompare(vb) * dir;
+        return (va - vb) * dir;
+    }});
+    // Reinsert rows in order
+    var fragment = document.createDocumentFragment();
+    rows.forEach(function(r){{ fragment.appendChild(r); }});
+    tbody.appendChild(fragment);
+    // Update suburb dividers
+    var vs = {{}};
+    rows.forEach(function(r){{ if(!r.classList.contains('hidden')) vs[r.getAttribute('data-suburb')]=true; }});
+    panel.querySelectorAll('tbody tr.cat-divider').forEach(function(d){{
+        var lbl = (d.querySelector('.cat-label')||{{}}).textContent||'';
+        d.classList.toggle('hidden', !vs[lbl]);
+    }});
 }}
 </script>
 </body>
@@ -369,9 +597,37 @@ def main():
         print("   (GitHub runner IP likely blocked. Run locally instead.)")
         sys.exit(1)
 
+    # Compare with previous data for new/drop detection
+    previous = load_previous_data()
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    new_count = 0
+    drop_count = 0
+    for city_name in all_data:
+        for l in all_data[city_name]:
+            lid = l.get('id', '')
+            if not lid or lid == '?' or l.get('address') == '?':
+                continue
+            rent = int(l.get('rent_weekly', '0') or '0')
+            if lid in previous:
+                prev = previous[lid]
+                prev_rent = prev.get('rent_weekly', 0)
+                if rent > 0 and prev_rent > 0 and rent < prev_rent:
+                    l['price_drop'] = prev_rent - rent
+                    drop_count += 1
+                l['_first_seen'] = prev.get('first_seen', today_str)
+            else:
+                l['is_new'] = True
+                l['_first_seen'] = today_str
+                new_count += 1
+    print(f"\n  🆕 {new_count} new, 🔻 {drop_count} price drops")
+
     html = generate_html(all_data)
     OUTPUT_FILE.write_text(html, encoding='utf-8')
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] ✅ Saved to {OUTPUT_FILE}")
+
+    # Save current data for next comparison
+    save_previous_data(all_data)
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ Saved comparison data to {HISTORY_FILE}")
 
 
 if __name__ == "__main__":
