@@ -2,7 +2,7 @@
 # Brisbane Rental — Auto-update script
 # Runs scraper and pushes to GitHub if data changed
 
-cd "/Users/lan/Desktop/订单/B/brisbane-rental" || exit 1
+cd "/Users/lan/Projects/B/brisbane-rental" || exit 1
 
 # Activate SSH agent and load key
 eval "$(ssh-agent -s)" 2>/dev/null

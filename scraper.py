@@ -19,12 +19,16 @@ CITIES = {
         "url_template": "https://www.theonsitemanager.com.au/rental-property?location=South%20Brisbane&page={page}",
         "link_pattern": "/apartment-for-rent/",
     },
+    "Brisbane City": {
+        "url_template": "https://www.theonsitemanager.com.au/rental-property?location=Brisbane%20City&page={page}",
+        "link_pattern": "/apartment-for-rent/",
+    },
 }
 
 SUBURBS_ORDER = [
     'Toowong','Taringa','Auchenflower','Indooroopilly','St Lucia','Paddington',
-    'South Brisbane','West End','Highgate Hill','Spring Hill','Kangaroo Point',
-    'Brisbane City','Woolloongabba','Dutton Park','Milton','Other',
+    'South Brisbane','Brisbane City','West End','Highgate Hill','Spring Hill',
+    'Kangaroo Point','Woolloongabba','Dutton Park','Milton','Other',
 ]
 
 KNOWN_SUBURBS = [
@@ -325,7 +329,7 @@ def generate_html(all_data):
 <body>
 <div class="header">
     <h1><span class="dot"></span>布里斯班租房列表</h1>
-    <p class="meta">📍 数据来源: <a href="https://www.theonsitemanager.com.au" target="_blank">The Onsite Manager</a> &ensp;|&ensp; 更新于 {now} &ensp;|&ensp; 共 {total_all} 套可租房源 &ensp;|&ensp; 每周一三五 10:00 自动更新</p>
+    <p class="meta">📍 数据来源: <a href="https://www.theonsitemanager.com.au" target="_blank">The Onsite Manager</a> &ensp;|&ensp; 更新于 {now} &ensp;|&ensp; 共 {total_all} 套可租房源 &ensp;|&ensp; 每个工作日 10:10 自动更新</p>
 </div>
 <nav class="tab-nav">{tab_btns}</nav>
 {panels}
