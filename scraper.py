@@ -1,634 +1,459 @@
 #!/usr/bin/env python3
 """
-布里斯班租房列表 — 自动更新脚本
-每周一三五 10:00 运行，抓取 The Onsite Manager 数据生成 HTML
+布里斯班租房看板 — 抓取 The Onsite Manager 公开 API 并生成静态页面。
+
+数据源: https://www.theonsitemanager.com.au/rental-property?location=South%20Brisbane
+站点是 Angular SPA，但 robots.txt 明确放行以下公开读 API:
+  /api/v1/listings.php  (列表，支持 location / page / limit)
+  /api/v1/listing.php   (详情，含 dateAvailable / inspections / 图片 / 电话)
+所以全程纯 HTTP JSON，不需要浏览器。
+
+用法:
+  python3 scraper.py            # 抓取 + 生成 index.html
+  python3 scraper.py --cache    # 用上次抓取的 data/listings.json 重新渲染（调试 UI 用）
+  python3 scraper.py --dry      # 只打印统计，不写文件
+
+产物: index.html、data/listings.json、previous_data.json
+页面模板: template.html（占位符 __DATA_JSON__ / __META_JSON__）
 """
-from playwright.sync_api import sync_playwright
-import time, re, json, sys
-from datetime import datetime
+from __future__ import annotations
+
+import argparse
+import html
+import json
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-OUTPUT_FILE = Path(__file__).parent / "index.html"
-HISTORY_FILE = Path(__file__).parent / "previous_data.json"
+ROOT = Path(__file__).parent
+OUT_HTML = ROOT / "index.html"
+TEMPLATE = ROOT / "template.html"
+OUT_JSON = ROOT / "data" / "listings.json"
+HISTORY = ROOT / "previous_data.json"
 
+BASE = "https://www.theonsitemanager.com.au"
+API_LIST = BASE + "/api/v1/listings.php"
+API_DETAIL = BASE + "/api/v1/listing.php"
+LIST_LOCATION = "South Brisbane"
 
-def load_previous_data():
-    """Load previous scrape data, return {listing_id: {rent, city, first_seen}}."""
-    if not HISTORY_FILE.exists():
-        return {}
-    try:
-        with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        return data.get('listings', {})
-    except (json.JSONDecodeError, KeyError, IOError):
-        return {}
+UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+HEADERS = {
+    "User-Agent": UA,
+    "Accept": "application/json, text/plain, */*",
+    "Referer": BASE + "/",
+}
+BRISBANE_TZ = timezone(timedelta(hours=10))
+PAGE_SIZE = 100
+DETAIL_WORKERS = 10
+REQUEST_RETRIES = 3
+NEW_WITHIN_DAYS = 7
 
-
-def save_previous_data(all_data):
-    """Save current listings as previous data for next comparison."""
-    listings = {}
-    for city_name, city_listings in all_data.items():
-        for l in city_listings:
-            lid = l.get('id', '')
-            if lid and lid != '?' and l.get('address') != '?':
-                listings[lid] = {
-                    'rent_weekly': int(l.get('rent_weekly', '0') or '0'),
-                    'city': city_name,
-                    'first_seen': l.get('_first_seen', datetime.now().strftime('%Y-%m-%d')),
-                }
-    with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
-        json.dump({'listings': listings, 'last_updated': datetime.now().strftime('%Y-%m-%d %H:%M')}, f, ensure_ascii=False)
-
-
-CITIES = {
-    "Toowong": {
-        "url_template": "https://www.theonsitemanager.com.au/rental-property/apartment?location=TOOWONG&proximity=0.20&page={page}",
-        "link_pattern": "/apartment-for-rent/",
-    },
-    "South Brisbane": {
-        "url_template": "https://www.theonsitemanager.com.au/rental-property?location=South%20Brisbane&page={page}",
-        "link_pattern": "/apartment-for-rent/",
-    },
-    "Brisbane City": {
-        "url_template": "https://www.theonsitemanager.com.au/rental-property/apartment?location=BRISBANE+CITY&proximity=0.20&page={page}",
-        "link_pattern": "/apartment-for-rent/",
-    },
+# 区域分组：沿用原页面的三个「圈」，其余郊区归入「其他周边」
+ZONES: dict[str, list[str]] = {
+    "South Brisbane 圈": [
+        "South Brisbane", "West End", "Highgate Hill", "Dutton Park",
+        "Woolloongabba", "Kangaroo Point", "East Brisbane", "Tarragindi",
+        "Moorooka", "Salisbury", "Annerley", "Greenslopes", "Coorparoo",
+        "Bulimba", "Morningside", "Cannon Hill", "Carina", "Carina Heights",
+        "Carindale", "Mount Gravatt East", "Upper Mount Gravatt", "Macgregor",
+        "Sunnybank", "Sunnybank Hills", "Runcorn", "Eight Mile Plains",
+        "Calamvale", "Algester", "Pallara", "Robertson", "Tarragindi",
+    ],
+    "Toowong 圈": [
+        "Toowong", "Taringa", "Auchenflower", "Indooroopilly", "St Lucia",
+        "Milton", "Paddington", "Bardon", "Ashgrove", "Red Hill",
+        "Petrie Terrace", "Sherwood", "Graceville", "Oxley",
+        "Seventeen Mile Rocks", "Richlands",
+    ],
+    "Brisbane City 圈": [
+        "Brisbane City", "Spring Hill", "Fortitude Valley", "Newstead",
+        "Teneriffe", "Bowen Hills", "New Farm", "Herston", "Kelvin Grove",
+        "Lutwyche", "Windsor", "Albion", "Alderley", "Stafford", "Enoggera",
+        "Nundah", "Chermside", "Hamilton", "Hendra", "Woolloowin",
+    ],
+}
+OTHER_ZONE = "其他周边"
+SUBURB_TO_ZONE = {s.strip(): z for z, subs in ZONES.items() for s in subs}
+ZONE_ORDER = list(ZONES) + [OTHER_ZONE]
+ZONE_SLUG = {
+    "South Brisbane 圈": "south-brisbane",
+    "Toowong 圈": "toowong",
+    "Brisbane City 圈": "brisbane-city",
+    OTHER_ZONE: "other",
 }
 
-SUBURBS_ORDER = [
-    'Toowong','Taringa','Auchenflower','Indooroopilly','St Lucia','Paddington',
-    'South Brisbane','Brisbane City','West End','Highgate Hill','Spring Hill',
-    'Kangaroo Point','Woolloongabba','Dutton Park','Milton','Other',
-]
-
-KNOWN_SUBURBS = [
-    'Toowong','West End','South Brisbane','Auchenflower','Taringa',
-    'Indooroopilly','St Lucia','Milton','Paddington','Bardon',
-    'Brisbane City','Fortitude Valley','Kangaroo Point','Highgate Hill',
-    'Spring Hill','Woolloongabba','Dutton Park',
-]
-
-
-def block_resources(page):
-    for ext in ['png','jpg','jpeg','gif','svg','woff','woff2','ttf']:
-        page.route(f"**/*.{ext}", lambda r: r.abort())
-    for domain in ['google-analytics','googletagmanager','onesignal','maps.googleapis']:
-        page.route(f"**/{domain}.com/**", lambda r: r.abort())
+CATEGORY_SLUG = {
+    "apartment": "apartment-for-rent",
+    "house": "house-for-rent",
+    "townhouse": "townhouse-for-rent",
+    "unit": "unit-for-rent",
+    "villa": "villa-for-rent",
+    "studio": "apartment-for-rent",
+    "duplex": "house-for-rent",
+    "land": "house-for-rent",
+}
+MONTHS_EN = {m: i for i, m in enumerate(
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], 1)}
 
 
-def scrape_city(browser, city_name, config):
-    """Scrape one city's listings (first 2 pages)."""
-    listings = []
-    seen_urls = set()
-
-    # === Collect URLs ===
-    collect_page = browser.new_page()
-    block_resources(collect_page)
-
-    for page_num in [1, 2]:
-        url = config["url_template"].format(page=page_num)
-        print(f"  [{city_name}] Collecting page {page_num}...")
+# ---------------------------------------------------------------- HTTP
+def _get(url: str, timeout: int = 40) -> dict:
+    last = None
+    for attempt in range(REQUEST_RETRIES):
         try:
-            collect_page.goto(url, wait_until="domcontentloaded", timeout=15000)
-            time.sleep(2)
-        except:
-            pass
-        links = collect_page.locator(f'a[href*="{config["link_pattern"]}"]').all()
-        for link in links:
-            try:
-                href = link.get_attribute('href')
-                if href and config["link_pattern"] in href:
-                    seen_urls.add(href)
-            except:
-                pass
-    collect_page.close()
-    urls = sorted(seen_urls)
-    print(f"  [{city_name}] {len(urls)} unique listings")
+            req = urllib.request.Request(url, headers=HEADERS)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8", "replace"))
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError,
+                OSError) as e:
+            last = e
+            time.sleep(0.6 * (attempt + 1))
+    raise RuntimeError(f"GET failed: {url} -> {last}")
 
-    # === Visit detail pages ===
-    for i, href in enumerate(urls):
-        full_url = f"https://www.theonsitemanager.com.au{href}"
-        listing_id = href.split('-')[-1]
 
-        page = browser.new_page()
-        block_resources(page)
+def fetch_all_rentals(max_pages: int = 10) -> list[dict]:
+    rows: list[dict] = []
+    page = 1
+    while page <= max_pages:
+        url = (f"{API_LIST}?class=rental&location="
+               f"{urllib.parse.quote(LIST_LOCATION)}&page={page}&limit={PAGE_SIZE}")
+        data = _get(url)
+        batch = data.get("data") or []
+        rows.extend(batch)
+        pg = data.get("pagination") or {}
+        print(f"  · 列表第 {page}/{pg.get('pages', '?')} 页: {len(batch)} 条 "
+              f"(total={pg.get('total')})", flush=True)
+        if len(batch) < PAGE_SIZE:
+            break
+        page += 1
+        time.sleep(0.25)
+    # 去重
+    seen, uniq = set(), []
+    for r in rows:
+        pid = str(r.get("pageId") or "")
+        if pid and pid not in seen:
+            seen.add(pid)
+            uniq.append(r)
+    return uniq
 
+
+def fetch_detail(page_id: str) -> dict:
+    try:
+        d = _get(f"{API_DETAIL}?id={urllib.parse.quote(str(page_id))}", timeout=25)
+        return (d.get("data") or {}) if d.get("success") else {}
+    except Exception as e:  # noqa: BLE001
+        print(f"    ! 详情 {page_id} 失败: {str(e)[:80]}", flush=True)
+        return {}
+
+
+# ---------------------------------------------------------------- 解析
+def _as_int(v, default: int = 0) -> int:
+    try:
+        return int(float(str(v).strip()))
+    except (TypeError, ValueError, AttributeError):
+        return default
+
+
+def _clean_phone(p) -> str:
+    if not p:
+        return ""
+    p = str(p).strip()
+    return "" if p.lower() in {"0", "nan", "none", "-", "n/a"} else p
+
+
+def parse_available(raw, today: datetime.date) -> tuple[str, str, str]:
+    """返回 (显示文本, 月份分档, 排序键)。过去/异常日期统一为「即日可租」。"""
+    if not raw:
+        return "即日可租", "now", "00000000"
+    txt = str(raw).strip()
+    if txt.startswith("0000"):
+        return "即日可租", "now", "00000000"
+    dt = None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d-%b-%Y"):
         try:
-            page.goto(full_url, wait_until="domcontentloaded", timeout=10000)
-            page.wait_for_timeout(500)
-
-            # Click truncated phone buttons to reveal full numbers
-            for btn in page.locator('a:has-text("Call"):not([href^="tel:"])').all():
-                try:
-                    if '...' in btn.inner_text():
-                        btn.click()
-                        page.wait_for_timeout(300)
-                except:
-                    pass
-
-            # Extract agent phone numbers
-            agent_phones = []
-            for tl in page.locator('a[href^="tel:"]').all():
-                try:
-                    n = tl.get_attribute('href').replace('tel:', '').strip()
-                    if n not in ['0738684047', '0407769944'] and n not in agent_phones:
-                        agent_phones.append(n)
-                except:
-                    pass
-
-            text = page.locator('body').inner_text()
-            info = {'url': full_url, 'id': listing_id}
-
-            addr = re.search(r'Address:\s*(.+?)(?:\n|$)', text)
-            info['address'] = addr.group(1).strip() if addr else '?'
-
-            date = re.search(r'Date Available:\s*(.+?)(?:\n|$)', text)
-            info['date_available'] = date.group(1).strip() if date else '?'
-
-            rent = re.search(r'Rent:\s*\$?([\d,]+)\s*weekly', text)
-            info['rent_weekly'] = rent.group(1).replace(',', '') if rent else '?'
-
-            det = re.search(r'Details:\s*\n?(\d+)\s*\n(\d+)\s*\n?(\d*)', text)
-            info['bed'] = det.group(1) if det else '?'
-            info['bath'] = det.group(2) if det else '?'
-            info['car'] = (det.group(3) or '0') if det else '0'
-
-            b, t_ = info['bed'], info['bath']
-            layout = f"{b}室{t_}卫" if b != '?' else '?'
-            if info.get('car') and info['car'] != '0':
-                layout += f"{info['car']}车位"
-            info['layout'] = layout
-
-            fm = re.search(r'(?i)Furnished:\s*(Yes|No)', text)
-            if fm:
-                info['furnished'] = '是' if fm.group(1).lower() == 'yes' else '否'
-            elif re.search(r'(?i)fully\s*furnished|furnished\s*apartment|comes\s*furnished', text):
-                info['furnished'] = '是'
-            elif re.search(r'(?i)unfurnished|not\s*furnished', text):
-                info['furnished'] = '否'
-            else:
-                info['furnished'] = '未知'
-
-            info['phone'] = ' / '.join(agent_phones) if agent_phones else '?'
-            apply_links = page.locator('a[href*="2apply.com.au"]').all()
-            info['apply_link'] = apply_links[0].get_attribute('href') if apply_links else '?'
-            info['contact'] = '见页面'
-
-            # Suburb detection
-            for s in KNOWN_SUBURBS:
-                if s.lower() in info['address'].lower():
-                    info['suburb'] = s
-                    break
-            else:
-                parts = [p.strip() for p in info['address'].split(',')]
-                info['suburb'] = parts[-3] if len(parts) >= 3 else 'Other'
-
-            listings.append(info)
-
-        except Exception as e:
-            print(f"  [{city_name}] ✗ {listing_id}: {str(e)[:60]}")
-
-        page.close()
-        time.sleep(0.2)
-
-    return listings
+            dt = datetime.strptime(txt[:19] if fmt.startswith("%Y-%m-%d %H") else txt, fmt)
+            break
+        except ValueError:
+            continue
+    if dt is None:
+        return "即日可租", "now", "00000000"
+    d = dt.date()
+    if d <= today:
+        return "即日可租", "now", "00000000"
+    y, m = d.year, d.month
+    label = f"{m}月{d.day}日"
+    if y != today.year:
+        label = f"{y}年{label}"
+    return label, f"{y:04d}-{m:02d}", d.strftime("%Y%m%d")
 
 
-def extract_contacts(browser, city_name, config, listings):
-    """Extract contact names from listing cards."""
-    id_map = {l['id']: l for l in listings}
+INSPECTION_RE = re.compile(
+    r"(\d{1,2})-([A-Za-z]{3})-(\d{4})\s+(\d{1,2}:\d{2}\s*[APap][Mm])\s+to\s+"
+    r"(\d{1,2}:\d{2}\s*[APap][Mm])")
 
-    for page_num in [1, 2]:
-        page = browser.new_page()
-        block_resources(page)
 
-        url = config["url_template"].format(page=page_num)
+def parse_inspections(raw, now: datetime) -> list[dict]:
+    """只保留未来的看房场次（官网详情页同样不展示已过期场次）。"""
+    if not raw:
+        return []
+    out: list[dict] = []
+    for line in re.split(r"[\r\n]+", str(raw)):
+        m = INSPECTION_RE.search(line)
+        if not m:
+            continue
+        day, mon, year, t1, t2 = m.groups()
+        mi = MONTHS_EN.get(mon.title())
+        if not mi:
+            continue
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=15000)
-            time.sleep(2)
-        except:
-            pass
-
-        text = page.locator('body').inner_text()
-        blocks = re.split(r'ID:\s*(\d{8})', text)
-
-        for i in range(1, len(blocks), 2):
-            lid = blocks[i]
-            block = blocks[i+1] if i+1 < len(blocks) else ''
-            lines = [l.strip() for l in block.split('\n') if l.strip()]
-
-            if lid in id_map:
-                for line in reversed(lines):
-                    if re.match(r'^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2}$', line):
-                        if not re.search(r'(?i)OPEN|INSPECTION|Rental|Property|Apartment|Available|From|QLD|Subscribe|About\s*This|Name$|Phone$|Email$|Comments$|Find|Search|Sort|Featured|PROPERTY|LOCATION|Page|Next|Previous|Sponsored|Finance|Mortgage|Apply|Book|Register|Contact|Listing', line):
-                            id_map[lid]['contact'] = line
-                            break
-        page.close()
+            start = datetime.strptime(
+                f"{int(day):02d}-{mon.title()}-{year} {t1.replace(' ', '').upper()}",
+                "%d-%b-%Y %I:%M%p").replace(tzinfo=BRISBANE_TZ)
+            end = datetime.strptime(
+                f"{int(day):02d}-{mon.title()}-{year} {t2.replace(' ', '').upper()}",
+                "%d-%b-%Y %I:%M%p").replace(tzinfo=BRISBANE_TZ)
+        except ValueError:
+            continue
+        if start < now:
+            continue
+        label = f"{start.month}月{start.day}日 {start.strftime('%H:%M')}–{end.strftime('%H:%M')}"
+        if start.year != now.year:
+            label = f"{start.year}年{label}"
+        out.append({"label": label, "iso": start.strftime("%Y-%m-%d %H:%M"),
+                    "key": start.strftime("%Y%m%d%H%M")})
+    out.sort(key=lambda x: x["key"])
+    return out
 
 
-def generate_html(all_data):
-    """Generate the combined HTML report."""
-    now = datetime.now().strftime('%Y-%m-%d %H:%M')
-
-    tab_btns = ""
-    panels = ""
-    first = True
-
-    for city_name, listings in all_data.items():
-        slug = city_name.lower().replace(' ', '-')
-        valid = [l for l in listings if l.get('address') != '?']
-
-        active = " active" if first else ""
-        first = False
-
-        tab_btns += f'<button class="tab-btn{active}" data-slug="{slug}" onclick="switchCity(\'{slug}\')">{city_name}<span class="count">{len(valid)}</span></button>\n'
-
-        # Group by suburb
-        suburb_groups = {}
-        for l in valid:
-            s = l.get('suburb', 'Other')
-            suburb_groups.setdefault(s, []).append(l)
-        for s in suburb_groups:
-            suburb_groups[s].sort(key=lambda x: int(x.get('rent_weekly', '0') or '0'))
-
-        rows = ""
-        for sub in SUBURBS_ORDER:
-            if sub not in suburb_groups:
-                continue
-            rents = [int(l.get('rent_weekly', '0') or '0') for l in suburb_groups[sub]]
-            rows += f'<tr class="cat-divider"><td colspan="7"><span class="cat-label">{sub}</span><span class="cat-count">{len(suburb_groups[sub])}套 · ${min(rents)}-${max(rents)}/周</span></td></tr>'
-
-            for l in suburb_groups[sub]:
-                rent = l.get('rent_weekly', '?')
-                layout = l.get('layout', '?')
-                addr = l.get('address', '?')
-                furnished = l.get('furnished', '未知')
-                date_avail = l.get('date_available', '?')
-                contact = l.get('contact', '见页面')
-                phone = l.get('phone', '?')
-                detail_url = l.get('url', '#')
-                bed = l.get('bed', '0')
-                is_new = l.get('is_new', False)
-                price_drop = l.get('price_drop', 0)
-
-                # Date formatting for sorting
-                date_sort = '99999999'
-                date_display = date_avail
-                try:
-                    dt = datetime.strptime(date_avail, '%d %b %Y')
-                    date_sort = dt.strftime('%Y%m%d')
-                    today = datetime.now()
-                    days_until = (dt - today).days
-                    if 'Available' in date_avail.lower() or 'now' in date_avail.lower() or days_until <= 0:
-                        date_sort = '00000000'
-                        date_display = f'<span class="date-soon">即日可租</span>'
-                    elif days_until <= 14:
-                        date_display = f'<span class="date-soon">{date_avail}</span>'
-                except ValueError:
-                    pass
-
-                # Search text for filtering
-                search_text = f'{layout} {addr} {sub} {rent} {furnished} {contact} {phone}'.lower()
-
-                # Data attributes for filtering/sorting
-                data_attrs = f'data-furnished="{furnished}" data-bed="{bed}" data-rent="{rent}" data-date="{date_sort}" data-suburb="{sub}" data-search="{search_text}"'
-
-                fb = {'是': '<span class="badge badge-yes">是</span>',
-                      '否': '<span class="badge badge-no">否</span>'}.get(furnished, '<span class="badge badge-unk">未知</span>')
-                ph = f'<a href="tel:{phone.replace(" ","")}" class="phone-link">{phone}</a>' if phone and phone != '?' else '<span class="no-link">—</span>'
-                btn = f'<a href="{detail_url}" target="_blank" class="apply-btn">详情</a>' if detail_url else '<span class="no-link">—</span>'
-
-                # Price column with badges
-                price_html = f'<span class="price">${rent}</span>'
-                if is_new:
-                    price_html += ' <span class="badge badge-new">🆕 新上</span>'
-                if price_drop > 0:
-                    price_html += f' <span class="badge badge-drop">🔻 -${price_drop}</span>'
-
-                rows += f'<tr {data_attrs}><td><span class="room-name">{layout}</span><div class="addr">{addr}</div></td><td>{fb}</td><td>{price_html}<span class="pw">/周</span></td><td>{date_display}</td><td>{contact}</td><td>{ph}</td><td>{btn}</td></tr>'
-
-        total = len(valid)
-        min_p = min(int(l['rent_weekly']) for l in valid if l['rent_weekly'].isdigit()) if valid else 0
-        max_p = max(int(l['rent_weekly']) for l in valid if l['rent_weekly'].isdigit()) if valid else 0
-        furn_yes = sum(1 for l in valid if l['furnished'] == '是')
-
-        panels += f'''
-    <div class="city-panel{active}" id="panel-{slug}">
-        <div class="stats">
-            <div class="stat"><div class="num">{total}</div><div class="lbl">总房源</div></div>
-            <div class="stat"><div class="num">{len(suburb_groups)}</div><div class="lbl">覆盖区域</div></div>
-            <div class="stat"><div class="num">${min_p}</div><div class="lbl">最低周租</div></div>
-            <div class="stat"><div class="num">${max_p}</div><div class="lbl">最高周租</div></div>
-            <div class="stat"><div class="num">{furn_yes}</div><div class="lbl">包家具</div></div>
-        </div>
-        <div class="filter-bar" id="filter-{slug}">
-            <input type="text" class="filter-search" placeholder="🔍 搜索地址/区域/联系人..." oninput="filterTable('{slug}')">
-            <div class="filter-btns">
-                <span class="filter-label">家具:</span>
-                <button class="fbtn active" data-filter="furnished" data-val="all" onclick="setFilter('{slug}','furnished','all',this)">全部</button>
-                <button class="fbtn" data-filter="furnished" data-val="是" onclick="setFilter('{slug}','furnished','是',this)">🛋️ 包家具</button>
-                <button class="fbtn" data-filter="furnished" data-val="否" onclick="setFilter('{slug}','furnished','否',this)">📦 不包家具</button>
-            </div>
-            <div class="filter-btns">
-                <span class="filter-label">户型:</span>
-                <button class="fbtn active" data-filter="layout" data-val="all" onclick="setFilter('{slug}','layout','all',this)">全部</button>
-                <button class="fbtn" data-filter="layout" data-val="studio" onclick="setFilter('{slug}','layout','studio',this)">Studio</button>
-                <button class="fbtn" data-filter="layout" data-val="1" onclick="setFilter('{slug}','layout','1',this)">1室</button>
-                <button class="fbtn" data-filter="layout" data-val="2" onclick="setFilter('{slug}','layout','2',this)">2室</button>
-                <button class="fbtn" data-filter="layout" data-val="3" onclick="setFilter('{slug}','layout','3',this)">3室+</button>
-            </div>
-            <div class="filter-btns filter-rent">
-                <span class="filter-label">周租金:</span>
-                <input type="number" class="rent-input" placeholder="最低" onchange="filterTable('{slug}')" id="rent-min-{slug}">
-                <span class="rent-sep">—</span>
-                <input type="number" class="rent-input" placeholder="最高" onchange="filterTable('{slug}')" id="rent-max-{slug}">
-            </div>
-            <span class="filter-count" id="fcount-{slug}"></span>
-            <button class="fbtn fclear" onclick="clearFilters('{slug}')">✕ 清除筛选</button>
-        </div>
-        <div class="table-wrap">
-            <table>
-                <thead><tr><th class="sortable" data-sort="layout" onclick="sortTable('{slug}', this)">户型 / 地址 <span class="sa"></span></th><th class="sortable" data-sort="furnished" onclick="sortTable('{slug}', this)">家具 <span class="sa"></span></th><th class="sortable" data-sort="rent" onclick="sortTable('{slug}', this)">周租金 <span class="sa"></span></th><th class="sortable" data-sort="date" onclick="sortTable('{slug}', this)">可入住 <span class="sa"></span></th><th>联系人</th><th>电话</th><th>详情</th></tr></thead>
-                <tbody>{rows}<tr class="empty-state"><td colspan="7">😕 没有匹配的房源，试试调整筛选条件</td></tr></tbody>
-            </table>
-        </div>
-    </div>'''
-
-    total_all = sum(len([l for l in d if l.get('address') != '?']) for d in all_data.values())
-
-    return f'''<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>布里斯班租房列表 — The Onsite Manager</title>
-<link href="https://api.fontshare.com/v2/css?f[]=satoshi@400,500,600,700&display=swap" rel="stylesheet">
-<style>
-    :root {{ --bg:#fafaf9;--card-bg:#fff;--text:#1a1a1a;--text-muted:#6b7280;--border:#e5e4e1;--green:#059669;--green-bg:#ecfdf5;--amber:#d97706;--amber-bg:#fffbeb;--red:#dc2626;--red-bg:#fef2f2;--radius:10px;--font:'Satoshi',system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif }}
-    @media (prefers-color-scheme:dark){{ :root{{ --bg:#0c0c0c;--card-bg:#161616;--text:#e5e5e5;--text-muted:#8b8b8b;--border:#262626 }} .cat-divider td{{ background:#1a1a1a!important }} }}
-    *,*::before,*::after{{ box-sizing:border-box;margin:0;padding:0 }}
-    html{{ font-family:var(--font);-webkit-font-smoothing:antialiased;background:var(--bg);color:var(--text) }}
-    body{{ max-width:1150px;margin:0 auto;padding:32px 20px 60px;line-height:1.6 }}
-    .header{{ margin-bottom:20px }}
-    .header h1{{ font-size:clamp(1.3rem,3vw,1.6rem);font-weight:700;letter-spacing:-0.025em;display:flex;align-items:center;gap:8px }}
-    .header h1 .dot{{ width:10px;height:10px;border-radius:50%;background:#E21836;flex-shrink:0 }}
-    .header .meta{{ color:var(--text-muted);font-size:0.82rem;line-height:1.7 }}
-    .header a{{ color:var(--text-muted) }}
-    .tab-nav{{ display:flex;gap:6px;margin-bottom:22px;overflow-x:auto;scrollbar-width:none }}
-    .tab-nav::-webkit-scrollbar{{ display:none }}
-    .tab-btn{{ flex-shrink:0;padding:10px 22px;border-radius:8px;cursor:pointer;font-size:0.9rem;font-weight:600;color:var(--text-muted);border:1px solid var(--border);background:var(--card-bg);font-family:var(--font);transition:all 200ms;white-space:nowrap;letter-spacing:-0.01em }}
-    .tab-btn:hover{{ color:var(--text);border-color:var(--text-muted) }}
-    .tab-btn.active{{ background:var(--text);color:var(--bg);border-color:var(--text) }}
-    .tab-btn .count{{ font-size:0.7rem;opacity:0.5;margin-left:4px;font-weight:400 }}
-    .city-panel{{ display:none }}
-    .city-panel.active{{ display:block }}
-    .stats{{ display:flex;gap:12px;flex-wrap:wrap;margin-bottom:20px }}
-    .stat{{ background:var(--card-bg);border:1px solid var(--border);border-radius:var(--radius);padding:14px 18px;min-width:90px }}
-    .stat .num{{ font-size:1.4rem;font-weight:700 }}
-    .stat .lbl{{ font-size:0.7rem;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.05em }}
-    .table-wrap{{ background:var(--card-bg);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden }}
-    table{{ width:100%;border-collapse:collapse;font-size:0.875rem }}
-    th{{ text-align:left;padding:12px 16px;font-weight:600;font-size:0.7rem;text-transform:uppercase;letter-spacing:0.07em;color:var(--text-muted);background:var(--bg);border-bottom:1px solid var(--border);white-space:nowrap }}
-    td{{ padding:12px 16px;border-bottom:1px solid var(--border);vertical-align:top }}
-    tr:last-child td{{ border-bottom:none }}
-    tbody tr{{ transition:background 200ms }}
-    tbody tr:hover{{ background:var(--bg) }}
-    .cat-divider td{{ padding:10px 16px!important;background:var(--bg);border-bottom:1px solid var(--border) }}
-    .cat-label{{ font-size:0.75rem;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:var(--text) }}
-    .cat-count{{ font-size:0.7rem;color:var(--text-muted);margin-left:10px;font-weight:400 }}
-    .room-name{{ font-weight:600 }}
-    .addr{{ font-size:0.76rem;color:var(--text-muted);margin-top:2px;line-height:1.4;max-width:280px }}
-    .price{{ font-weight:700;color:#E21836 }}
-    .badge{{ display:inline-block;padding:3px 10px;border-radius:99px;font-size:0.75rem;font-weight:600;white-space:nowrap }}
-    .badge-yes{{ background:var(--green-bg);color:var(--green) }}
-    .badge-no{{ background:var(--red-bg);color:var(--red) }}
-    .badge-unk{{ background:var(--amber-bg);color:var(--amber) }}
-    .apply-btn{{ display:inline-block;padding:5px 14px;background:#E21836;color:#fff;border-radius:6px;text-decoration:none;font-size:0.78rem;font-weight:600;transition:opacity 200ms }}
-    .apply-btn:hover{{ opacity:0.85 }}
-    .phone-link{{ color:var(--text);text-decoration:none;font-variant-numeric:tabular-nums;font-weight:500 }}
-    .phone-link:hover{{ color:#E21836 }}
-    .no-link{{ color:var(--text-muted);font-size:0.8rem }}
-    .footer{{ margin-top:40px;padding-top:20px;border-top:1px solid var(--border);text-align:center;color:var(--text-muted);font-size:0.78rem }}
-    .footer a{{ color:var(--text-muted) }}
-    .filter-bar{{ display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:12px 16px;background:var(--card-bg);border:1px solid var(--border);border-radius:var(--radius);margin-bottom:12px;position:sticky;top:0;z-index:5 }}
-    .filter-search{{ flex:0 1 200px;padding:7px 12px;border:1px solid var(--border);border-radius:6px;font-size:0.82rem;font-family:var(--font);background:var(--bg);color:var(--text);min-width:160px }}
-    .filter-search:focus{{ border-color:#E21836;outline:none;box-shadow:0 0 0 2px rgba(226,24,54,.12) }}
-    .filter-btns{{ display:flex;align-items:center;gap:4px }}
-    .filter-label{{ font-size:0.7rem;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.05em;margin-right:2px;white-space:nowrap }}
-    .fbtn{{ padding:5px 11px;border:1px solid var(--border);border-radius:99px;cursor:pointer;font-size:0.76rem;font-weight:500;background:var(--bg);color:var(--text-muted);font-family:var(--font);transition:all 150ms;white-space:nowrap }}
-    .fbtn:hover{{ border-color:var(--text-muted);color:var(--text) }}
-    .fbtn.active{{ background:#E21836;color:#fff;border-color:#E21836;font-weight:600 }}
-    .fclear{{ background:transparent;border-color:transparent;color:var(--text-muted);font-size:0.72rem }}
-    .fclear:hover{{ color:#E21836;background:transparent }}
-    .filter-rent{{ gap:6px }}
-    .rent-input{{ width:72px;padding:5px 8px;border:1px solid var(--border);border-radius:6px;font-size:0.8rem;font-family:var(--font);background:var(--bg);color:var(--text) }}
-    .rent-input:focus{{ border-color:#E21836;outline:none;box-shadow:0 0 0 2px rgba(226,24,54,.12) }}
-    .rent-sep{{ color:var(--text-muted);font-size:0.8rem }}
-    .filter-count{{ font-size:0.75rem;color:var(--text-muted);white-space:nowrap;margin-left:auto }}
-    .pw{{ font-size:0.82rem;color:var(--text-muted) }}
-    .badge-new{{ background:#d1fae5;color:#065f46;margin-left:4px }}
-    .badge-drop{{ background:#fef2f2;color:#dc2626;margin-left:4px }}
-    .date-soon{{ color:#059669;font-weight:600 }}
-    th.sortable{{ cursor:pointer;user-select:none;transition:background 150ms }}
-    th.sortable:hover{{ background:#ffe5e6 }}
-    .sa{{ font-size:0.65rem;margin-left:3px;opacity:0.4 }}
-    .sa.asc{{ opacity:1;color:#E21836 }}
-    .sa.desc{{ opacity:1;color:#E21836 }}
-    tr.hidden{{ display:none }}
-    .empty-state{{ text-align:center;padding:40px 20px;color:var(--text-muted);display:none }}
-    .empty-state.show{{ display:table-row }}
-    .empty-state td{{ padding:40px 20px!important }}
-    @media(max-width:768px){{ body{{ padding:20px 12px 50px }} .table-wrap{{ overflow-x:auto;-webkit-overflow-scrolling:touch }} table{{ min-width:720px;font-size:0.8rem }} .stats{{ gap:8px }} .stat{{ padding:10px 14px }} }}
-</style>
-</head>
-<body>
-<div class="header">
-    <h1><span class="dot"></span>布里斯班租房列表</h1>
-    <p class="meta">📍 数据来源: <a href="https://www.theonsitemanager.com.au" target="_blank">The Onsite Manager</a> &ensp;|&ensp; 更新于 {now} &ensp;|&ensp; 共 {total_all} 套可租房源 &ensp;|&ensp; 每个工作日 10:10 自动更新</p>
-</div>
-<nav class="tab-nav">{tab_btns}</nav>
-{panels}
-<div class="footer"><p>数据来源: <a href="https://www.theonsitemanager.com.au" target="_blank">theonsitemanager.com.au</a> · 更新于 {now}</p></div>
-<script>
-// --- Filter & Sort State (per tab) ---
-const _state = {{}};
-function st(slug) {{
-    if (!_state[slug]) _state[slug] = {{furnished:'all',layout:'all',sortCol:null,sortDir:1}};
-    return _state[slug];
-}}
-
-function switchCity(slug) {{
-    document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
-    document.querySelectorAll('.city-panel').forEach(p=>p.classList.remove('active'));
-    document.querySelector('.tab-btn[data-slug="'+slug+'"]').classList.add('active');
-    document.getElementById('panel-'+slug).classList.add('active');
-    filterTable(slug);
-}}
-
-// --- Filter ---
-function setFilter(slug, type, val, btn) {{
-    st(slug)[type] = val;
-    btn.parentElement.querySelectorAll('.fbtn').forEach(b=>b.classList.remove('active'));
-    btn.classList.add('active');
-    filterTable(slug);
-}}
-
-function clearFilters(slug) {{
-    var s = st(slug);
-    s.furnished = 'all'; s.layout = 'all';
-    var bar = document.getElementById('filter-'+slug);
-    if(bar){{
-        bar.querySelectorAll('.fbtn').forEach(function(b){{ if(b.getAttribute('data-val')==='all') b.classList.add('active'); else b.classList.remove('active'); }});
-        var mi = document.getElementById('rent-min-'+slug), mx = document.getElementById('rent-max-'+slug);
-        if(mi) mi.value = ''; if(mx) mx.value = '';
-        var si = bar.querySelector('.filter-search');
-        if(si) si.value = '';
-    }}
-    filterTable(slug);
-}}
-
-function filterTable(slug) {{
-    var s = st(slug);
-    var panel = document.getElementById('panel-'+slug);
-    if(!panel || !panel.classList.contains('active')) return;
-    var rows = panel.querySelectorAll('tbody tr:not(.cat-divider):not(.empty-state)');
-    var searchInput = panel.querySelector('.filter-search');
-    var search = searchInput ? searchInput.value.toLowerCase() : '';
-    var rentMin = parseInt((document.getElementById('rent-min-'+slug)||{{}}).value) || 0;
-    var rentMax = parseInt((document.getElementById('rent-max-'+slug)||{{}}).value) || 99999;
-    var count = 0;
-    var visibleSuburbs = {{}};
-    rows.forEach(function(r){{
-        var show = true;
-        if (s.furnished !== 'all' && r.getAttribute('data-furnished') !== s.furnished) show = false;
-        var bed = parseInt(r.getAttribute('data-bed')||'0');
-        if (s.layout === 'studio' && bed !== 0) show = false;
-        else if (s.layout === '1' && bed !== 1) show = false;
-        else if (s.layout === '2' && bed !== 2) show = false;
-        else if (s.layout === '3' && bed < 3) show = false;
-        var rent = parseInt(r.getAttribute('data-rent')) || 0;
-        if (rent > 0 && (rent < rentMin || rent > rentMax)) show = false;
-        if (search && (r.getAttribute('data-search')||'').indexOf(search) === -1) show = false;
-        if (show) {{ r.classList.remove('hidden'); count++; visibleSuburbs[r.getAttribute('data-suburb')]=true; }}
-        else r.classList.add('hidden');
-    }});
-    // Hide empty suburb dividers
-    panel.querySelectorAll('tbody tr.cat-divider').forEach(function(d){{
-        var label = (d.querySelector('.cat-label')||{{}}).textContent||'';
-        d.classList.toggle('hidden', !visibleSuburbs[label]);
-    }});
-    // Update count
-    var fc = document.getElementById('fcount-'+slug);
-    if (fc) fc.textContent = '找到 '+count+' 套';
-    // Show/hide empty state
-    var es = panel.querySelector('.empty-state');
-    if (es) es.classList.toggle('show', count === 0);
-    // Re-apply current sort if active
-    if (s.sortCol) {{
-        var th = document.querySelector('#panel-'+slug+' th[data-sort="'+s.sortCol+'"]');
-        if (th) sortTable(slug, th, true);
-    }}
-}}
-
-// --- Sort ---
-function sortTable(slug, th, keepDir) {{
-    if (!th) return;
-    var s = st(slug);
-    var col = th.getAttribute('data-sort');
-    if (!keepDir) {{
-        if (s.sortCol === col) s.sortDir *= -1;
-        else {{ s.sortCol = col; s.sortDir = 1; }}
-    }}
-    var dir = s.sortDir;
-    // Update arrows
-    document.querySelectorAll('#panel-'+slug+' th .sa').forEach(function(a){{ a.textContent='';a.classList.remove('asc','desc'); }});
-    var arrow = th.querySelector('.sa');
-    if (arrow) {{ arrow.textContent = dir > 0 ? '▲' : '▼'; arrow.classList.add(dir > 0 ? 'asc' : 'desc'); }}
-    // Sort
-    var panel = document.getElementById('panel-'+slug);
-    var tbody = panel.querySelector('tbody');
-    var rows = Array.from(tbody.querySelectorAll('tr:not(.cat-divider):not(.empty-state)'));
-    rows.sort(function(a,b){{
-        var va, vb;
-        if (col === 'rent') {{ va = parseInt(a.getAttribute('data-rent'))||0; vb = parseInt(b.getAttribute('data-rent'))||0; }}
-        else if (col === 'date') {{ va = a.getAttribute('data-date')||'99999999'; vb = b.getAttribute('data-date')||'99999999'; }}
-        else if (col === 'furnished') {{ var fo={{'是':1,'否':2,'未知':3}}; va=fo[a.getAttribute('data-furnished')]||2; vb=fo[b.getAttribute('data-furnished')]||2; }}
-        else if (col === 'layout') {{ va = parseInt(a.getAttribute('data-bed'))||0; vb = parseInt(b.getAttribute('data-bed'))||0; if(va===vb){{ va=(a.getAttribute('data-suburb')||''); vb=(b.getAttribute('data-suburb')||''); return va.localeCompare(vb)*dir; }} }}
-        if (typeof va === 'string') return va.localeCompare(vb) * dir;
-        return (va - vb) * dir;
-    }});
-    // Reinsert rows in order
-    var fragment = document.createDocumentFragment();
-    rows.forEach(function(r){{ fragment.appendChild(r); }});
-    tbody.appendChild(fragment);
-    // Update suburb dividers
-    var vs = {{}};
-    rows.forEach(function(r){{ if(!r.classList.contains('hidden')) vs[r.getAttribute('data-suburb')]=true; }});
-    panel.querySelectorAll('tbody tr.cat-divider').forEach(function(d){{
-        var lbl = (d.querySelector('.cat-label')||{{}}).textContent||'';
-        d.classList.toggle('hidden', !vs[lbl]);
-    }});
-}}
-</script>
-</body>
-</html>'''
+def _image_url(row: dict, detail: dict) -> str:
+    img = row.get("image") or ""
+    if not img:
+        imgs = detail.get("images") or []
+        if imgs and isinstance(imgs, list):
+            img = (imgs[0] or {}).get("thumb") or ""
+        if not img:
+            img = detail.get("mainImage") or ""
+    img = str(img or "").strip()
+    if not img:
+        return ""
+    return img if img.startswith("http") else BASE + "/" + img.lstrip("/")
 
 
-def main():
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Starting rental report update...")
-    all_data = {}
+def normalize(row: dict, detail: dict, history: dict,
+              now: datetime) -> dict:
+    pid = str(row.get("pageId") or detail.get("pageId") or "")
+    suburb = str(row.get("suburb") or detail.get("suburb") or "").strip()
+    state = str(row.get("state") or detail.get("state") or "QLD").strip()
+    zone = SUBURB_TO_ZONE.get(suburb, OTHER_ZONE)
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=['--no-sandbox'])
+    street_no = str(row.get("streetNumber") or detail.get("streetNumber") or "").strip()
+    street = str(row.get("street") or detail.get("street") or "").strip()
+    postcode = str(row.get("postcode") or detail.get("postcode") or "").strip()
+    display_ok = str(row.get("addressDisplay") or detail.get("addressDisplay")
+                     or "yes").lower() == "yes"
+    if display_ok and street:
+        address = ", ".join(x for x in
+                            [f"{street_no} {street}".strip(), suburb, state, postcode] if x)
+    elif suburb:
+        address = f"{suburb}, {state} {postcode}".strip()
+    else:
+        address = suburb or "地址见详情"
 
-        for city_name, config in CITIES.items():
-            print(f"\n--- {city_name} ---")
-            listings = scrape_city(browser, city_name, config)
-            extract_contacts(browser, city_name, config, listings)
-            all_data[city_name] = listings
-            valid = sum(1 for l in listings if l.get('address') != '?')
-            print(f"  ✓ {city_name}: {valid} listings")
+    bed = _as_int(row.get("bedrooms", detail.get("bedrooms")))
+    bath = _as_int(row.get("bathrooms", detail.get("bathrooms")))
+    car = _as_int(row.get("carSpaces", detail.get("carSpaces")))
+    layout = f"{bed}室{bath}卫" if bed else (row.get("category") or "房源")
+    if car:
+        layout += f"{car}车位"
 
-        browser.close()
+    furn_raw = str(detail.get("furnished") if detail else "").strip().lower()
+    furnished = "是" if furn_raw in {"1", "yes", "true"} else (
+        "否" if furn_raw in {"0", "no", "false"} else "未知")
 
-    total_listings = sum(len(v) for v in all_data.values() if v)
-    if total_listings == 0:
-        print("\n❌ ERROR: No data fetched for any city! Refusing to write empty report.")
-        print("   (GitHub runner IP likely blocked. Run locally instead.)")
-        sys.exit(1)
+    rent = _as_int(row.get("price") or detail.get("price"))
+    date_display, bucket, date_key = parse_available(
+        detail.get("dateAvailable") or row.get("dateAvailable"), now.date())
+    inspections = parse_inspections(detail.get("inspections"), now)
 
-    # Compare with previous data for new/drop detection
-    previous = load_previous_data()
-    today_str = datetime.now().strftime('%Y-%m-%d')
-    new_count = 0
-    drop_count = 0
-    for city_name in all_data:
-        for l in all_data[city_name]:
-            lid = l.get('id', '')
-            if not lid or lid == '?' or l.get('address') == '?':
-                continue
-            rent = int(l.get('rent_weekly', '0') or '0')
-            if lid in previous:
-                prev = previous[lid]
-                prev_rent = prev.get('rent_weekly', 0)
-                if rent > 0 and prev_rent > 0 and rent < prev_rent:
-                    l['price_drop'] = prev_rent - rent
-                    drop_count += 1
-                l['_first_seen'] = prev.get('first_seen', today_str)
-            else:
-                l['is_new'] = True
-                l['_first_seen'] = today_str
-                new_count += 1
-    print(f"\n  🆕 {new_count} new, 🔻 {drop_count} price drops")
+    phone = (_clean_phone(detail.get("listingAgentPhone"))
+             or _clean_phone(detail.get("agentPhone"))
+             or _clean_phone(detail.get("managerPhone")))
+    contact = (str(detail.get("listingAgentName") or "").strip()
+               or str(detail.get("agentContact") or "").strip()
+               or str(detail.get("managerName") or "").strip()
+               or str(row.get("agentContact") or "").strip()
+               or str(row.get("businessName") or "").strip()
+               or "见详情页")
 
-    html = generate_html(all_data)
-    OUTPUT_FILE.write_text(html, encoding='utf-8')
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] ✅ Saved to {OUTPUT_FILE}")
+    slug_type = CATEGORY_SLUG.get(
+        str(row.get("category") or detail.get("category") or "Apartment").strip().lower(),
+        "apartment-for-rent")
+    sub_slug = re.sub(r"[^A-Za-z0-9]", "", suburb) or "Brisbane"
+    url = f"{BASE}/{slug_type}/{sub_slug}-{state}-{pid}"
 
-    # Save current data for next comparison
-    save_previous_data(all_data)
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ Saved comparison data to {HISTORY_FILE}")
+    entry = str(detail.get("entryDate") or row.get("timestamp") or "")[:10]
+    is_new = False
+    try:
+        is_new = (now.date() - datetime.strptime(entry, "%Y-%m-%d").date()).days <= NEW_WITHIN_DAYS
+    except ValueError:
+        pass
+
+    prev = history.get(pid) or {}
+    prev_rent = _as_int(prev.get("rent_weekly"))
+    price_change = ""
+    if prev_rent > 0 and rent > 0 and rent != prev_rent:
+        price_change = "down" if rent < prev_rent else "up"
+
+    pets_raw = str(row.get("pets") or detail.get("pets") or "").lower()
+    return {
+        "id": pid,
+        "title": str(row.get("title") or detail.get("title") or "").strip(),
+        "suburb": suburb,
+        "zone": zone,
+        "address": address,
+        "layout": layout,
+        "bed": bed,
+        "bath": bath,
+        "car": car,
+        "rent": rent,
+        "bond": _as_int(row.get("bond") or detail.get("bond")),
+        "category": str(row.get("category") or detail.get("category") or "").strip(),
+        "furnished": furnished,
+        "pets": "可养宠物" if pets_raw in {"1", "yes", "true"} else "",
+        "date_display": date_display,
+        "bucket": bucket,
+        "date_key": date_key,
+        "inspections": inspections,
+        "insp_key": inspections[0]["key"] if inspections else "999999999999",
+        "contact": contact,
+        "phone": phone,
+        "image": _image_url(row, detail),
+        "url": url,
+        "inspect_url": f"{BASE}/inspect/{pid}",
+        "is_new": is_new,
+        "price_change": price_change,
+        "listed_at": entry,
+    }
+
+
+# ---------------------------------------------------------------- 历史
+def load_history() -> dict:
+    try:
+        return json.loads(HISTORY.read_text(encoding="utf-8")).get("listings", {})
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def save_history(items: list[dict]) -> None:
+    old = load_history()
+    today = datetime.now(BRISBANE_TZ).strftime("%Y-%m-%d")
+    payload = {
+        "listings": {
+            it["id"]: {
+                "rent_weekly": it["rent"],
+                "city": it["zone"],
+                "first_seen": (old.get(it["id"]) or {}).get("first_seen", today),
+            }
+            for it in items if it["id"]
+        },
+        "last_updated": datetime.now(BRISBANE_TZ).strftime("%Y-%m-%d %H:%M"),
+    }
+    HISTORY.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+# ---------------------------------------------------------------- 生成
+def month_range(items: list[dict], today: datetime.date) -> list[str]:
+    """从当月到所有房源中最晚的可入住月份，连续生成（中间空月份保留）。"""
+    buckets = {it["bucket"] for it in items if it["bucket"] != "now"}
+    start = f"{today.year:04d}-{today.month:02d}"
+    if not buckets:
+        return [start]
+    last = max(buckets)
+    months, cur = [], start
+    while cur <= last:
+        months.append(cur)
+        y, m = map(int, cur.split("-"))
+        cur = f"{y + 1:04d}-01" if m == 12 else f"{y:04d}-{m + 1:02d}"
+        if len(months) > 36:
+            break
+    return months
+
+
+def build_meta(items: list[dict], now: datetime, months: list[str]) -> dict:
+    counts = {z: sum(1 for it in items if it["zone"] == z) for z in ZONE_ORDER}
+    return {
+        "generated": now.strftime("%Y-%m-%d %H:%M"),
+        "total": len(items),
+        "months": months,
+        "zones": [{"name": z, "slug": ZONE_SLUG[z], "count": counts[z]}
+                  for z in ZONE_ORDER if counts[z]],
+        "source_list": f"{BASE}/rental-property?location=South%20Brisbane",
+        "with_slots": sum(1 for it in items if it["inspections"]),
+        "available_now": sum(1 for it in items if it["bucket"] == "now"),
+    }
+
+
+def render(items: list[dict], meta: dict) -> str:
+    tpl = TEMPLATE.read_text(encoding="utf-8")
+    data_json = json.dumps(items, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
+    meta_json = json.dumps(meta, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
+    out = tpl.replace("__DATA_JSON__", data_json).replace("__META_JSON__", meta_json)
+    out = out.replace("__SOURCE_LIST__", html.escape(meta["source_list"]))
+    out = out.replace("__TOTAL__", str(meta["total"]))
+    out = out.replace("__GENERATED__", html.escape(meta["generated"]))
+    return out
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--cache", action="store_true", help="用本地缓存重新渲染")
+    ap.add_argument("--dry", action="store_true", help="只打印统计")
+    args = ap.parse_args()
+
+    now = datetime.now(BRISBANE_TZ)
+    history = load_history()
+    OUT_JSON.parent.mkdir(parents=True, exist_ok=True)
+
+    if args.cache and OUT_JSON.exists():
+        print("· 使用缓存数据 data/listings.json")
+        items = json.loads(OUT_JSON.read_text(encoding="utf-8"))
+    else:
+        print("· 抓取列表 ...")
+        rows = fetch_all_rentals()
+        print(f"· 列表共 {len(rows)} 套，抓取详情 ...", flush=True)
+        ids = [str(r["pageId"]) for r in rows]
+        with ThreadPoolExecutor(max_workers=DETAIL_WORKERS) as ex:
+            details = list(ex.map(fetch_detail, ids))
+        ok = sum(1 for d in details if d)
+        print(f"· 详情成功 {ok}/{len(rows)}", flush=True)
+        items = [normalize(r, d, history, now) for r, d in zip(rows, details)]
+        items = [it for it in items if it["id"] and it["rent"] > 0]
+        items.sort(key=lambda x: (x["date_key"], x["rent"]))
+        OUT_JSON.write_text(json.dumps(items, ensure_ascii=False), encoding="utf-8")
+
+    months = month_range(items, now.date())
+    meta = build_meta(items, now, months)
+    print(f"· 房源 {len(items)} 套 | 月份 {', '.join(months)} | "
+          f"有未来看房场次 {meta['with_slots']} 套 | 即日可租 {meta['available_now']} 套")
+    for z in meta["zones"]:
+        print(f"    {z['name']}: {z['count']}")
+
+    if args.dry:
+        return 0
+
+    OUT_HTML.write_text(render(items, meta), encoding="utf-8")
+    save_history(items)
+    print(f"· 已生成 {OUT_HTML} ({OUT_HTML.stat().st_size / 1024:.0f} KB)")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

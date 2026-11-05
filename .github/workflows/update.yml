@@ -23,12 +23,7 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install dependencies
-        run: |
-          pip install playwright
-          playwright install chromium
-
-      - name: Run scraper
+      - name: Run scraper (public JSON API, stdlib only)
         run: python3 scraper.py
 
       - name: Commit and push

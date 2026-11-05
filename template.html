@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>布里斯班租房列表 — South Brisbane 及周边</title>
+<link href="https://api.fontshare.com/v2/css?f[]=satoshi@400,500,700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#f3f9f4; --card:#fff; --ink:#1c3526; --muted:#6d8a78; --faint:#93aa9b;
+  --line:#dcebdf; --line-soft:#eaf4ec; --green:#2f7d4f; --green-deep:#225f3b;
+  --green-soft:#e6f4ea; --green-tint:#f0f8f2; --price:#b23b2e;
+  --amber:#a86a13; --amber-soft:#fdf5e6; --radius:12px;
+  --font:'Satoshi',system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{font-family:var(--font);-webkit-font-smoothing:antialiased;background:var(--bg);color:var(--ink)}
+body{max-width:1240px;margin:0 auto;padding:30px 20px 70px;line-height:1.6}
+a{color:var(--green-deep)}
+.header{margin-bottom:18px}
+.header h1{font-size:clamp(1.35rem,3vw,1.75rem);font-weight:700;letter-spacing:-0.025em;display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.header h1 .dot{width:11px;height:11px;border-radius:50%;background:var(--green);flex-shrink:0}
+.header .meta{color:var(--muted);font-size:0.82rem;line-height:1.8;margin-top:5px}
+.header .meta a{color:var(--green-deep);text-decoration:none;border-bottom:1px solid var(--line)}
+.panel{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:15px 18px;margin-bottom:14px}
+.panel-title{font-size:0.9rem;font-weight:700;display:flex;align-items:center;gap:9px;margin-bottom:11px;flex-wrap:wrap}
+.panel-title .tag{font-size:0.68rem;font-weight:500;color:var(--green-deep);background:var(--green-soft);border-radius:99px;padding:2px 9px}
+.panel-title .note{margin-left:auto;font-size:0.72rem;color:var(--faint);font-weight:400}
+.chips{display:flex;gap:7px;flex-wrap:wrap}
+.chip{border:1px solid var(--line);background:var(--green-tint);color:var(--green-deep);font-family:var(--font);font-size:0.82rem;font-weight:500;padding:6px 14px;border-radius:99px;cursor:pointer;transition:all .16s;white-space:nowrap}
+.chip:hover{border-color:var(--green);background:var(--green-soft)}
+.chip.active{background:var(--green);color:#fff;border-color:var(--green)}
+.chip.empty{opacity:.45;cursor:not-allowed}
+.chip .n{font-size:0.72rem;opacity:.7;margin-left:5px;font-weight:400}
+.tabs{display:flex;gap:7px;overflow-x:auto;scrollbar-width:none;margin-bottom:14px;padding-bottom:2px}
+.tabs::-webkit-scrollbar{display:none}
+.tab{flex-shrink:0;padding:9px 18px;border-radius:9px;cursor:pointer;font-size:0.86rem;font-weight:500;color:var(--muted);border:1px solid var(--line);background:var(--card);font-family:var(--font);transition:all .16s;white-space:nowrap}
+.tab:hover{border-color:var(--green);color:var(--green-deep)}
+.tab.active{background:var(--green);color:#fff;border-color:var(--green)}
+.tab .n{font-size:0.72rem;opacity:.7;margin-left:5px}
+.stats{display:flex;gap:11px;flex-wrap:wrap;margin-bottom:14px}
+.stat{flex:1;min-width:130px;background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:13px 16px}
+.stat .num{font-size:1.4rem;font-weight:700;letter-spacing:-0.02em}
+.stat .lbl{font-size:0.72rem;color:var(--muted)}
+.filters{display:flex;gap:10px;flex-wrap:wrap;align-items:center;background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:13px 16px;margin-bottom:14px}
+.filters input,.filters select,.filters button{font-family:var(--font);font-size:0.83rem;padding:7px 11px;border:1px solid var(--line);border-radius:8px;background:var(--green-tint);color:var(--ink);outline:none}
+.filters input:focus,.filters select:focus{border-color:var(--green)}
+.filters input[type=search]{min-width:220px;flex:1}
+.filters input[type=number]{width:88px}
+.filters label{font-size:0.78rem;color:var(--muted);display:flex;align-items:center;gap:5px;white-space:nowrap}
+.filters .sep{color:var(--faint)}
+.filters button{cursor:pointer;border-color:var(--green);color:var(--green-deep);background:var(--card);font-weight:500}
+.filters button:hover{background:var(--green-soft)}
+.table-wrap{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden}
+table{width:100%;border-collapse:collapse;font-size:0.85rem;table-layout:fixed}
+th{text-align:left;padding:11px 13px;font-weight:700;font-size:0.7rem;letter-spacing:0.04em;color:var(--muted);background:var(--green-tint);border-bottom:1px solid var(--line);white-space:nowrap}
+th.sortable{cursor:pointer;user-select:none}
+th.sortable:hover{color:var(--green-deep)}
+th .sa{font-size:0.7rem;opacity:.6;margin-left:3px}
+td{padding:11px 13px;border-bottom:1px solid var(--line-soft);vertical-align:middle;word-break:break-word}
+tbody tr:last-child td{border-bottom:none}
+tbody tr:hover{background:var(--green-tint)}
+.room{display:flex;gap:10px;align-items:center}
+.room img{width:56px;height:44px;object-fit:cover;border-radius:7px;background:var(--line-soft);flex-shrink:0;border:1px solid var(--line-soft)}
+.room-name{font-weight:700;line-height:1.35}
+.addr{font-size:0.75rem;color:var(--muted);margin-top:3px;line-height:1.4}
+.badge{display:inline-block;padding:1px 7px;border-radius:99px;font-size:0.68rem;font-weight:500;margin-left:5px;white-space:nowrap;vertical-align:1px}
+.badge-new{background:var(--green-soft);color:var(--green-deep)}
+.badge-down{background:#e4f3e7;color:#1f6b3b}
+.badge-up{background:var(--amber-soft);color:var(--amber)}
+.badge-pets{background:var(--green-tint);color:var(--muted)}
+.price{font-weight:700;color:var(--price);white-space:nowrap}
+.price small{font-weight:400;color:var(--muted);font-size:0.72rem}
+.date-now{color:var(--green-deep);font-weight:700}
+.date-soon{color:var(--amber);font-weight:500}
+.muted{color:var(--faint)}
+.insp-next{font-size:0.8rem;color:var(--green-deep);font-weight:500;line-height:1.4}
+.insp-toggle{font-family:var(--font);font-size:0.72rem;color:var(--green);background:none;border:none;cursor:pointer;padding:2px 0;text-decoration:underline dotted}
+.insp-list{margin-top:5px;padding:6px 9px;background:var(--green-tint);border-radius:7px;font-size:0.75rem;color:var(--muted);line-height:1.7}
+.insp-hint{font-size:0.7rem;color:var(--faint);display:block;margin-top:2px}
+.contact{font-size:0.8rem}
+.phone{font-size:0.76rem;color:var(--muted);text-decoration:none}
+.phone:hover{text-decoration:underline}
+.actions{display:flex;gap:6px;flex-wrap:wrap}
+.btn{display:inline-block;font-size:0.76rem;font-weight:500;padding:6px 11px;border-radius:8px;text-decoration:none;white-space:nowrap;border:1px solid var(--line);color:var(--green-deep);background:var(--card);transition:all .16s}
+.btn:hover{background:var(--green-soft);border-color:var(--green)}
+.btn-primary{background:var(--green);color:#fff;border-color:var(--green)}
+.btn-primary:hover{background:var(--green-deep);color:#fff}
+.empty-state{text-align:center;padding:46px 20px;color:var(--muted);font-size:0.9rem}
+.more-wrap{text-align:center;padding:16px;border-top:1px solid var(--line-soft);background:var(--green-tint)}
+.more-wrap button{font-family:var(--font);font-size:0.83rem;font-weight:500;padding:9px 22px;border-radius:8px;border:1px solid var(--green);color:var(--green-deep);background:var(--card);cursor:pointer}
+.more-wrap button:hover{background:var(--green-soft)}
+.more-wrap .count{font-size:0.75rem;color:var(--muted);margin-bottom:9px}
+.footer{margin-top:20px;color:var(--muted);font-size:0.76rem;line-height:1.9}
+.footer strong{color:var(--ink)}
+@media (max-width:900px){
+  table,thead,tbody,tr,td{display:block;width:100%}
+  thead{display:none}
+  tbody tr{padding:12px 14px;border-bottom:1px solid var(--line)}
+  tbody tr:hover{background:transparent}
+  td{border:none;padding:3px 0;display:flex;gap:10px;align-items:baseline}
+  td::before{content:attr(data-label);flex:0 0 76px;color:var(--faint);font-size:0.72rem}
+  td.actions-cell,td.room-cell{display:block}
+  td.actions-cell::before,td.room-cell::before{display:none}
+  .room img{width:72px;height:56px}
+  .actions{margin-top:8px}
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1><span class="dot"></span>布里斯班租房列表 <span style="font-size:0.72rem;font-weight:500;color:var(--green-deep);background:var(--green-soft);padding:3px 10px;border-radius:99px;letter-spacing:0">South Brisbane 及周边</span></h1>
+  <p class="meta">数据来源：<a href="__SOURCE_LIST__" target="_blank" rel="noopener">The Onsite Manager · South Brisbane 筛选页</a> &ensp;|&ensp; 更新于 __GENERATED__（布里斯班时间） &ensp;|&ensp; 共 <strong id="head-total">__TOTAL__</strong> 套在租房源 &ensp;|&ensp; 每个工作日自动更新</p>
+</div>
+
+<div class="panel" id="month-panel">
+  <div class="panel-title">按月份筛选 <span class="tag">可入住月份</span><span class="note">从当月到所有房源中最晚的可入住月份，随数据自动生成</span></div>
+  <div class="chips" id="month-chips"></div>
+</div>
+
+<div class="tabs" id="zone-tabs"></div>
+
+<div class="stats">
+  <div class="stat"><div class="num" id="stat-total">0</div><div class="lbl">全部房源</div></div>
+  <div class="stat"><div class="num" id="stat-shown">0</div><div class="lbl">当前筛选结果</div></div>
+  <div class="stat"><div class="num" id="stat-insp">0</div><div class="lbl">有可预约场次</div></div>
+  <div class="stat"><div class="num" id="stat-rent">—</div><div class="lbl">平均周租 (A$)</div></div>
+</div>
+
+<div class="filters">
+  <input type="search" id="f-q" placeholder="搜索地址、郊区或标题…">
+  <label>周租 <input type="number" id="f-min" placeholder="最低" min="0"></label>
+  <span class="sep">–</span>
+  <input type="number" id="f-max" placeholder="最高" min="0">
+  <select id="f-furn"><option value="all">家具不限</option><option value="是">有家具</option><option value="否">无家具</option></select>
+  <label><input type="checkbox" id="f-insp" style="width:auto"> 仅看有看房排期</label>
+  <button type="button" id="f-clear">清除筛选</button>
+</div>
+
+<div class="table-wrap">
+  <table>
+    <thead><tr>
+      <th class="sortable" data-sort="layout" style="width:26%">户型 / 地址 <span class="sa"></span></th>
+      <th class="sortable" data-sort="furnished" style="width:7%">家具 <span class="sa"></span></th>
+      <th class="sortable" data-sort="rent" style="width:10%">周租金 <span class="sa"></span></th>
+      <th class="sortable" data-sort="date_key" style="width:11%">可入住 <span class="sa"></span></th>
+      <th class="sortable" data-sort="insp_key" style="width:19%">可看房时间 <span class="sa"></span></th>
+      <th style="width:12%">联系人</th>
+      <th style="width:15%">操作</th>
+    </tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div id="empty" class="empty-state" hidden>没有符合条件的房源。<br><button type="button" class="btn" style="margin-top:12px" onclick="clearFilters()">清除筛选条件</button></div>
+  <div class="more-wrap" id="more-wrap" hidden><div class="count" id="more-count"></div><button type="button" id="more-btn">加载更多房源</button></div>
+</div>
+
+<div class="footer">
+  <strong>说明：</strong>「即日可租」表示房源的可入住日期已过或未填写；月份筛选按可入住日期精确匹配，即日可租单独成档。<br>
+  <strong>看房时间：</strong>取自每个房源详情页的 Inspection Times，只展示尚未过期的场次；点击「预约看房」将打开官网预约页（<code>/inspect/房源ID</code>），暂无排期的房源也可在官网请求一个看房时间。<br>
+  数据由 <a href="__SOURCE_LIST__" target="_blank" rel="noopener">The Onsite Manager</a> 公开接口自动抓取，仅供参考，实际房态与预约结果以官网为准。
+</div>
+
+<script>
+const RAW = __DATA_JSON__;
+const META = __META_JSON__;
+const ZONE_NAME = {};
+META.zones.forEach(z => ZONE_NAME[z.slug] = z.name);
+const state = {month:'all', zone:'all', q:'', min:0, max:0, furn:'all', inspOnly:false,
+               sort:'date_key', asc:true, limit:50};
+const $ = id => document.getElementById(id);
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const monthLabel = b => b === 'now' ? '即日可租' : (() => {
+  const [y,m] = b.split('-'); return String(y).slice(2) + '年' + Number(m) + '月';
+})();
+
+function matchCommon(it, skip){
+  if (skip !== 'zone' && state.zone !== 'all' && it.zone !== ZONE_NAME[state.zone]) return false;
+  if (skip !== 'month'){
+    if (state.month !== 'all' && it.bucket !== state.month) return false;
+  }
+  if (state.q){
+    const hay = (it.address + ' ' + it.suburb + ' ' + it.title + ' ' + it.layout).toLowerCase();
+    if (!hay.includes(state.q)) return false;
+  }
+  if (state.min && it.rent < state.min) return false;
+  if (state.max && it.rent > state.max) return false;
+  if (state.furn !== 'all' && it.furnished !== state.furn) return false;
+  if (state.inspOnly && !it.inspections.length) return false;
+  return true;
+}
+const resultSet = () => RAW.filter(it => matchCommon(it, null));
+
+function renderMonths(){
+  const base = RAW.filter(it => matchCommon(it, 'month'));
+  const counts = {};
+  base.forEach(it => counts[it.bucket] = (counts[it.bucket] || 0) + 1);
+  const make = (key, label, n, enabled) =>
+    `<button type="button" class="chip${state.month===key?' active':''}${enabled?'':' empty'}" data-month="${key}"${enabled?'':' disabled'}>${esc(label)}<span class="n">${n}</span></button>`;
+  let h = make('all', '全部', base.length, true);
+  META.months.forEach(m => h += make(m, monthLabel(m), counts[m] || 0, true));
+  h += make('now', '即日可租', counts['now'] || 0, true);
+  $('month-chips').innerHTML = h;
+  $('month-chips').querySelectorAll('.chip').forEach(b => b.onclick = () => {
+    state.month = b.dataset.month; state.limit = 50; render();
+  });
+}
+
+function renderTabs(){
+  const base = RAW.filter(it => matchCommon(it, 'zone'));
+  const counts = {};
+  base.forEach(it => counts[it.zone] = (counts[it.zone] || 0) + 1);
+  let h = `<button type="button" class="tab${state.zone==='all'?' active':''}" data-zone="all">全部区域<span class="n">${base.length}</span></button>`;
+  META.zones.forEach(z => h += `<button type="button" class="tab${state.zone===z.slug?' active':''}" data-zone="${z.slug}">${esc(z.name)}<span class="n">${counts[z.name] || 0}</span></button>`);
+  $('zone-tabs').innerHTML = h;
+  $('zone-tabs').querySelectorAll('.tab').forEach(b => b.onclick = () => {
+    state.zone = b.dataset.zone; state.limit = 50; render();
+  });
+}
+
+function inspCell(it){
+  const list = it.inspections || [];
+  if (!list.length) return `<span class="muted">暂无排期</span><span class="insp-hint">可在官网请求看房时间</span>`;
+  let h = `<div class="insp-next">${esc(list[0].label)}</div>`;
+  if (list.length > 1){
+    h += `<button type="button" class="insp-toggle" data-insp="${esc(it.id)}" data-count="${list.length-1}">还有 ${list.length-1} 场</button>`;
+    h += `<div class="insp-list" id="insp-${esc(it.id)}" hidden>${list.slice(1).map(x => esc(x.label)).join('<br>')}</div>`;
+  }
+  return h;
+}
+
+function rowHTML(it){
+  const badges =
+    (it.is_new ? '<span class="badge badge-new">新上</span>' : '') +
+    (it.price_change === 'down' ? '<span class="badge badge-down">降价</span>' : '') +
+    (it.price_change === 'up' ? '<span class="badge badge-up">涨价</span>' : '') +
+    (it.pets ? '<span class="badge badge-pets">可养宠物</span>' : '');
+  const img = it.image
+    ? `<img src="${esc(it.image)}" alt="" loading="lazy" onerror="this.style.display='none'">`
+    : '';
+  const dateCls = it.bucket === 'now' ? 'date-now' :
+    (it.date_key <= addDaysKey(30) ? 'date-soon' : '');
+  return `<tr>
+    <td class="room-cell" data-label="户型 / 地址"><div class="room">${img}<div>
+      <div class="room-name">${esc(it.layout)}${badges}</div>
+      <div class="addr">${esc(it.address)}</div>
+      <div class="addr">${esc(it.title)}</div>
+    </div></div></td>
+    <td data-label="家具">${esc(it.furnished)}</td>
+    <td data-label="周租金"><span class="price">A$${it.rent}<small> /周</small></span></td>
+    <td data-label="可入住"><span class="${dateCls}">${esc(it.date_display)}</span></td>
+    <td data-label="可看房时间">${inspCell(it)}</td>
+    <td data-label="联系人"><div class="contact">${esc(it.contact)}</div>${it.phone ? `<a class="phone" href="tel:${esc(it.phone)}">${esc(it.phone)}</a>` : ''}</td>
+    <td class="actions-cell" data-label="操作"><div class="actions">
+      <a class="btn" href="${esc(it.url)}" target="_blank" rel="noopener">详情</a>
+      <a class="btn btn-primary" href="${esc(it.inspect_url)}" target="_blank" rel="noopener" title="跳转到官网预约看房页">预约看房</a>
+    </div></td>
+  </tr>`;
+}
+
+function addDaysKey(n){
+  const d = new Date(Date.now() + n * 86400000);
+  return d.getFullYear() + String(d.getMonth()+1).padStart(2,'0') + String(d.getDate()).padStart(2,'0');
+}
+
+const sortValue = (it, key) => ({
+  layout: it.bed * 100 + it.bath, furnished: it.furnished, rent: it.rent,
+  date_key: it.date_key, insp_key: it.insp_key, address: it.address
+}[key] ?? it.date_key);
+
+function render(){
+  renderMonths(); renderTabs();
+  const list = resultSet();
+  const key = state.sort;
+  list.sort((a,b) => {
+    const x = sortValue(a,key), y = sortValue(b,key);
+    let c = (typeof x === 'number' && typeof y === 'number') ? x - y : String(x).localeCompare(String(y));
+    if (!state.asc) c = -c;
+    return c || a.rent - b.rent;
+  });
+  const shown = list.slice(0, state.limit);
+  $('rows').innerHTML = shown.map(rowHTML).join('');
+  $('rows').querySelectorAll('.insp-toggle').forEach(b => b.onclick = () => {
+    const box = $('insp-' + b.dataset.insp);
+    if (!box) return;
+    box.hidden = !box.hidden;
+    b.textContent = box.hidden ? `还有 ${b.dataset.count} 场` : '收起';
+  });
+  $('empty').hidden = list.length !== 0;
+  $('more-wrap').hidden = list.length <= state.limit;
+  $('more-count').textContent = `已显示 ${shown.length} / ${list.length} 套`;
+  $('stat-total').textContent = RAW.length;
+  $('stat-shown').textContent = list.length;
+  $('stat-insp').textContent = list.filter(it => it.inspections.length).length;
+  $('stat-rent').textContent = list.length
+    ? Math.round(list.reduce((s,it) => s + it.rent, 0) / list.length) : '—';
+  document.querySelectorAll('th.sortable').forEach(th => {
+    const sa = th.querySelector('.sa');
+    sa.textContent = th.dataset.sort === state.sort ? (state.asc ? '↑' : '↓') : '';
+  });
+}
+
+function clearFilters(){
+  state.month = 'all'; state.zone = 'all'; state.q = ''; state.min = 0; state.max = 0;
+  state.furn = 'all'; state.inspOnly = false; state.limit = 50;
+  $('f-q').value = ''; $('f-min').value = ''; $('f-max').value = '';
+  $('f-furn').value = 'all'; $('f-insp').checked = false;
+  render();
+}
+$('f-clear').onclick = clearFilters;
+$('f-q').oninput = e => { state.q = e.target.value.trim().toLowerCase(); state.limit = 50; render(); };
+$('f-min').oninput = e => { state.min = Number(e.target.value) || 0; state.limit = 50; render(); };
+$('f-max').oninput = e => { state.max = Number(e.target.value) || 0; state.limit = 50; render(); };
+$('f-furn').onchange = e => { state.furn = e.target.value; state.limit = 50; render(); };
+$('f-insp').onchange = e => { state.inspOnly = e.target.checked; state.limit = 50; render(); };
+$('more-btn').onclick = () => { state.limit += 50; render(); window.scrollBy(0, -80); };
+document.querySelectorAll('th.sortable').forEach(th => th.onclick = () => {
+  if (state.sort === th.dataset.sort) state.asc = !state.asc;
+  else { state.sort = th.dataset.sort; state.asc = true; }
+  render();
+});
+render();
+</script>
+</body>
+</html>
